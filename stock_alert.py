@@ -56,15 +56,28 @@ def build_krx_map():
         return
     log.info("KRX 종목 맵 생성 중...")
     try:
+        # pykrx로 KOSPI+KOSDAQ 종목명 수집 (get_market_ticker_name 사용)
         today = datetime.now().strftime("%Y%m%d")
-        for market in ["KOSPI", "KOSDAQ"]:
-            for code in krx.get_market_ticker_list(today, market=market):
-                try:
-                    name = krx.get_market_ticker_name(code)
+        all_codes = []
+        try:
+            all_codes += list(krx.get_market_ticker_list(market="KOSPI"))
+        except:
+            all_codes += list(krx.get_market_ticker_list(today, "KOSPI"))
+        try:
+            all_codes += list(krx.get_market_ticker_list(market="KOSDAQ"))
+        except:
+            all_codes += list(krx.get_market_ticker_list(today, "KOSDAQ"))
+        for code in all_codes:
+            try:
+                name = krx.get_market_ticker_name(code)
+                if name:
                     krx_name_map[name] = code
-                except: pass
-        save_json(KRX_MAP_FILE, krx_name_map)
-        log.info(f"KRX 맵 완료: {len(krx_name_map)}개")
+            except: pass
+        if krx_name_map:
+            save_json(KRX_MAP_FILE, krx_name_map)
+            log.info(f"KRX 맵 완료: {len(krx_name_map)}개")
+        else:
+            log.warning("KRX 맵이 비어있음 - 코드 직접 입력 방식으로 동작")
     except Exception as e:
         log.error(f"KRX 맵 오류: {e}")
 
@@ -89,9 +102,27 @@ def find_ticker(query):
         try: name = krx.get_market_ticker_name(q)
         except: name = t
         return (t, name)
-    if qu.replace("-","").isalpha():
+    # 영문 티커 (미국주식/암호화폐) - 한글 없고 영문만
+    if qu.replace("-","").isalnum() and all(c.isascii() for c in q):
         return (qu, qu)
-    return search_krx(q)
+    # 한글 포함 → KRX 맵 검색 → 없으면 pykrx 직접 검색
+    res = search_krx(q)
+    if res:
+        return res
+    # KRX 맵 빌드 안 됐을 때 pykrx로 직접 검색 (fallback)
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        tickers = krx.get_market_ticker_list(market="KOSPI") + krx.get_market_ticker_list(market="KOSDAQ")
+        for code in tickers:
+            try:
+                name = krx.get_market_ticker_name(code)
+                if name and q.lower() in name.lower():
+                    krx_name_map[name] = code  # 캐시에도 저장
+                    return (code + ".KS", name)
+            except: pass
+    except Exception as e:
+        log.error(f"pykrx 직접 검색 실패: {e}")
+    return None
 
 def calc_stoch(df, k, d):
     lo = df["Low"].rolling(k).min()
