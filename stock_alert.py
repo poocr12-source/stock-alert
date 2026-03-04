@@ -56,17 +56,8 @@ def build_krx_map():
         return
     log.info("KRX 종목 맵 생성 중...")
     try:
-        # pykrx로 KOSPI+KOSDAQ 종목명 수집 (get_market_ticker_name 사용)
         today = datetime.now().strftime("%Y%m%d")
-        all_codes = []
-        try:
-            all_codes += list(krx.get_market_ticker_list(market="KOSPI"))
-        except:
-            all_codes += list(krx.get_market_ticker_list(today, "KOSPI"))
-        try:
-            all_codes += list(krx.get_market_ticker_list(market="KOSDAQ"))
-        except:
-            all_codes += list(krx.get_market_ticker_list(today, "KOSDAQ"))
+        all_codes = list(krx.get_market_ticker_list(today, "KOSPI")) +                     list(krx.get_market_ticker_list(today, "KOSDAQ"))
         for code in all_codes:
             try:
                 name = krx.get_market_ticker_name(code)
@@ -77,7 +68,7 @@ def build_krx_map():
             save_json(KRX_MAP_FILE, krx_name_map)
             log.info(f"KRX 맵 완료: {len(krx_name_map)}개")
         else:
-            log.warning("KRX 맵이 비어있음 - 코드 직접 입력 방식으로 동작")
+            log.warning("KRX 맵 비어있음")
     except Exception as e:
         log.error(f"KRX 맵 오류: {e}")
 
@@ -112,12 +103,12 @@ def find_ticker(query):
     # KRX 맵 빌드 안 됐을 때 pykrx로 직접 검색 (fallback)
     try:
         today = datetime.now().strftime("%Y%m%d")
-        tickers = krx.get_market_ticker_list(market="KOSPI") + krx.get_market_ticker_list(market="KOSDAQ")
+        tickers = list(krx.get_market_ticker_list(today, "KOSPI")) +                   list(krx.get_market_ticker_list(today, "KOSDAQ"))
         for code in tickers:
             try:
                 name = krx.get_market_ticker_name(code)
                 if name and q.lower() in name.lower():
-                    krx_name_map[name] = code  # 캐시에도 저장
+                    krx_name_map[name] = code
                     return (code + ".KS", name)
             except: pass
     except Exception as e:
