@@ -1,16 +1,15 @@
 """
-📈 매수 알람 시스템 v4
-- 한국 주식: pykrx (해외 서버에서도 작동, 원화 기준 정확)
+📈 매수 알람 시스템 v5
+- 한국 주식 이름 검색: KRX 공식 REST API
+- 한국 주식 데이터: yfinance .KS 티커 (원화 기준)
 - 미국/암호화폐: yfinance
-- 종목명 검색: pykrx 종목 목록에서 한글 검색
 """
 
 import time, threading, logging, json, os
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import yfinance as yf
 import requests
-from pykrx import stock as krx
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WATCHLIST,
     STOCH_K_PERIOD, STOCH_D_PERIOD, STOCH_OVERSOLD,
@@ -41,36 +40,45 @@ def save_json(path, data):
 
 def get_display(ticker):
     name = ticker_names.get(ticker)
-    return f"{name} ({ticker})" if name else ticker
+    return "%s (%s)" % (name, ticker) if name else ticker
 
 current_watchlist = load_json(WATCHLIST_FILE, list(WATCHLIST))
 ticker_names      = load_json(NAMES_FILE, {})
 krx_name_map      = {}
 
+# ── KRX 공식 REST API로 종목 맵 빌드 ──
 def build_krx_map():
     global krx_name_map
     cached = load_json(KRX_MAP_FILE, {})
     if cached:
         krx_name_map = cached
-        log.info(f"KRX 종목 맵 로드: {len(krx_name_map)}개")
+        log.info("KRX 종목 맵 로드 완료: %d개" % len(krx_name_map))
         return
     log.info("KRX 종목 맵 생성 중...")
     try:
-        today = datetime.now().strftime("%Y%m%d")
-        all_codes = list(krx.get_market_ticker_list(today, "KOSPI")) +                     list(krx.get_market_ticker_list(today, "KOSDAQ"))
-        for code in all_codes:
-            try:
-                name = krx.get_market_ticker_name(code)
-                if name:
-                    krx_name_map[name] = code
-            except: pass
-        if krx_name_map:
+        url     = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
+        result  = {}
+        for mktId in ["STK", "KSQ"]:
+            payload = {
+                "bld": "dbms/MDC/STAT/standard/MDCSTAT01901",
+                "mktId": mktId, "share": "1", "csvxls_isNo": "false",
+            }
+            r    = requests.post(url, data=payload, headers=headers, timeout=15)
+            data = r.json()
+            for item in data.get("OutBlock_1", []):
+                name = item.get("ISU_ABBRV", "").strip()
+                code = item.get("ISU_SRT_CD", "").strip()
+                if name and code:
+                    result[name] = code
+        if result:
+            krx_name_map = result
             save_json(KRX_MAP_FILE, krx_name_map)
-            log.info(f"KRX 맵 완료: {len(krx_name_map)}개")
+            log.info("KRX 맵 완료: %d개" % len(krx_name_map))
         else:
             log.warning("KRX 맵 비어있음")
     except Exception as e:
-        log.error(f"KRX 맵 오류: {e}")
+        log.error("KRX 맵 오류: %s" % str(e))
 
 def search_krx(query):
     q = query.strip()
@@ -89,32 +97,19 @@ def find_ticker(query):
     if qu.endswith(".KS") or qu.endswith(".KQ"):
         return (qu, ticker_names.get(qu, qu))
     if q.isdigit() and len(q) == 6:
-        t = q + ".KS"
-        try: name = krx.get_market_ticker_name(q)
-        except: name = t
-        return (t, name)
-    # 영문 티커 (미국주식/암호화폐) - 한글 없고 영문만
-    if qu.replace("-","").isalnum() and all(c.isascii() for c in q):
+        return (q + ".KS", ticker_names.get(q + ".KS", q))
+    if qu.replace("-", "").isalnum() and all(c.isascii() for c in q):
         return (qu, qu)
-    # 한글 포함 → KRX 맵 검색 → 없으면 pykrx 직접 검색
+    # 한글 → KRX 맵 검색
     res = search_krx(q)
-    if res:
-        return res
-    # KRX 맵 빌드 안 됐을 때 pykrx로 직접 검색 (fallback)
-    try:
-        today = datetime.now().strftime("%Y%m%d")
-        tickers = list(krx.get_market_ticker_list(today, "KOSPI")) +                   list(krx.get_market_ticker_list(today, "KOSDAQ"))
-        for code in tickers:
-            try:
-                name = krx.get_market_ticker_name(code)
-                if name and q.lower() in name.lower():
-                    krx_name_map[name] = code
-                    return (code + ".KS", name)
-            except: pass
-    except Exception as e:
-        log.error(f"pykrx 직접 검색 실패: {e}")
+    if res: return res
+    # 맵 없으면 재빌드 후 재검색
+    if not krx_name_map:
+        build_krx_map()
+        return search_krx(q)
     return None
 
+# ── 지표 계산 ──
 def calc_stoch(df, k, d):
     lo = df["Low"].rolling(k).min()
     hi = df["High"].rolling(k).max()
@@ -135,53 +130,43 @@ def buy_signal(df):
     l = df.iloc[-1]
     return bool(l["%K"] <= STOCH_OVERSOLD and l["RSI"] <= RSI_OVERSOLD)
 
-def fetch_krx(ticker):
+# ── 데이터 수집 ──
+def fetch(ticker):
     try:
-        code  = ticker.split(".")[0]
-        end   = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
-        df    = krx.get_market_ohlcv(start, end, code)
-        if df is None or len(df) < 20: return None
-        df = df.rename(columns={"시가":"Open","고가":"High","저가":"Low","종가":"Close","거래량":"Volume"})
-        df.index = pd.to_datetime(df.index)
-        log.info(f"[{ticker}] pykrx 수집 ({len(df)}일) 최근가: {df['Close'].iloc[-1]:,.0f}원")
-        return df[["Open","High","Low","Close","Volume"]]
-    except Exception as e:
-        log.error(f"[{ticker}] pykrx 오류: {e}")
-        return None
-
-def fetch_yf(ticker):
-    try:
-        df = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period="90d", interval="1d", progress=False, auto_adjust=True)
         if df.empty or len(df) < 20: return None
         df.columns = df.columns.get_level_values(0)
+        latest = float(df["Close"].iloc[-1])
+        if is_korean(ticker):
+            log.info("[%s] 수집 완료 (%dd) 최근가: %s원" % (ticker, len(df), "{:,.0f}".format(latest)))
+        else:
+            log.info("[%s] 수집 완료 (%dd) 최근가: %.2f" % (ticker, len(df), latest))
         return df
     except Exception as e:
-        log.error(f"[{ticker}] yfinance 오류: {e}")
+        log.error("[%s] 수집 오류: %s" % (ticker, str(e)))
         return None
 
-def fetch(ticker):
-    return fetch_krx(ticker) if is_korean(ticker) else fetch_yf(ticker)
-
+# ── 텔레그램 ──
 def tg(msg, cid=None):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            "https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_BOT_TOKEN,
             json={"chat_id": cid or TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
             timeout=10
         )
     except Exception as e:
-        log.error(f"TG 오류: {e}")
+        log.error("TG 오류: %s" % str(e))
 
 def get_updates(offset=None):
     try:
         params = {"timeout": 30}
         if offset: params["offset"] = offset
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params, timeout=35)
+        r = requests.get("https://api.telegram.org/bot%s/getUpdates" % TELEGRAM_BOT_TOKEN, params=params, timeout=35)
         if r.status_code == 200: return r.json().get("result", [])
     except: pass
     return []
 
+# ── 명령어 처리 ──
 def handle(text, cid):
     global current_watchlist, ticker_names
     parts = text.strip().split(maxsplit=1)
@@ -189,65 +174,64 @@ def handle(text, cid):
     arg   = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd == "/add" and arg:
-        tg(f"⏳ *{arg}* 검색 중...", cid)
+        tg("⏳ *%s* 검색 중..." % arg, cid)
         res = find_ticker(arg)
         if not res:
-            tg(f"❌ *{arg}* 를 찾을 수 없어요.\n예: `/add 삼성전자` `/add AAPL` `/add BTC-USD`", cid)
+            tg("❌ *%s* 를 찾을 수 없어요.\n예: `/add 삼성전자` `/add AAPL` `/add BTC-USD`" % arg, cid)
             return
         ticker, name = res
         if ticker in current_watchlist:
-            tg(f"⚠️ *{get_display(ticker)}* 는 이미 모니터링 중!", cid); return
+            tg("⚠️ *%s* 는 이미 모니터링 중!" % get_display(ticker), cid); return
         if fetch(ticker) is None:
-            tg(f"❌ `{ticker}` 데이터를 가져올 수 없어요.", cid); return
+            tg("❌ `%s` 데이터를 가져올 수 없어요." % ticker, cid); return
         current_watchlist.append(ticker)
         ticker_names[ticker] = name
         save_json(WATCHLIST_FILE, current_watchlist)
         save_json(NAMES_FILE, ticker_names)
-        tg(f"✅ *{name} ({ticker})* 추가!\n종목 수: {len(current_watchlist)}개 | /list", cid)
+        tg("✅ *%s (%s)* 추가!\n종목 수: %d개 | /list" % (name, ticker, len(current_watchlist)), cid)
 
     elif cmd == "/remove" and arg:
         target = arg.upper() if arg.upper() in current_watchlist else next(
-            (t for t in current_watchlist if ticker_names.get(t,"").replace(" ","") == arg.replace(" ","")), None)
+            (t for t in current_watchlist if ticker_names.get(t, "").replace(" ", "") == arg.replace(" ", "")), None)
         if target:
             current_watchlist.remove(target)
             save_json(WATCHLIST_FILE, current_watchlist)
-            tg(f"🗑 *{get_display(target)}* 삭제!\n남은 종목: {len(current_watchlist)}개", cid)
+            tg("🗑 *%s* 삭제!\n남은 종목: %d개" % (get_display(target), len(current_watchlist)), cid)
         else:
-            tg(f"⚠️ *{arg}* 는 목록에 없어요. /list 확인", cid)
+            tg("⚠️ *%s* 는 목록에 없어요. /list 확인" % arg, cid)
 
     elif cmd == "/list":
         if not current_watchlist:
             tg("📋 종목 없음\n`/add 종목명` 으로 추가!", cid)
         else:
-            items = "\n".join([f"  • {get_display(t)}" for t in current_watchlist])
-            tg(f"📋 *모니터링 종목* ({len(current_watchlist)}개)\n━━━━━━━━━━━━━━\n{items}", cid)
+            items = "\n".join(["  • %s" % get_display(t) for t in current_watchlist])
+            tg("📋 *모니터링 종목* (%d개)\n━━━━━━━━━━━━━━\n%s" % (len(current_watchlist), items), cid)
 
     elif cmd == "/check" and arg:
-        tg(f"⏳ *{arg}* 확인 중...", cid)
+        tg("⏳ *%s* 확인 중..." % arg, cid)
         res = find_ticker(arg)
-        if not res: tg(f"❌ *{arg}* 를 찾을 수 없어요.", cid); return
+        if not res: tg("❌ *%s* 를 찾을 수 없어요." % arg, cid); return
         ticker, name = res
         df = fetch(ticker)
-        if df is None: tg(f"❌ `{ticker}` 데이터 없음", cid); return
-        df = calc_rsi(calc_stoch(df, STOCH_K_PERIOD, STOCH_D_PERIOD), RSI_PERIOD)
-        l  = df.iloc[-1]
-        pr = f"{l['Close']:,.0f}원" if is_korean(ticker) else f"{l['Close']:.2f}"
+        if df is None: tg("❌ `%s` 데이터 없음" % ticker, cid); return
+        df  = calc_rsi(calc_stoch(df, STOCH_K_PERIOD, STOCH_D_PERIOD), RSI_PERIOD)
+        l   = df.iloc[-1]
+        pr  = "%s원" % "{:,.0f}".format(float(l["Close"])) if is_korean(ticker) else "%.2f" % float(l["Close"])
         sig = "🔴 *매수 신호!*" if buy_signal(df) else "⚪ 신호 없음"
-        tg(f"📊 *{name} ({ticker})*\n━━━━━━━━━━━━━━\n"
-           f"💰 `{pr}`\n📊 %K: `{l['%K']:.1f}` (≤{STOCH_OVERSOLD})\n"
-           f"📉 RSI: `{l['RSI']:.1f}` (≤{RSI_OVERSOLD})\n━━━━━━━━━━━━━━\n{sig}", cid)
+        tg("📊 *%s (%s)*\n━━━━━━━━━━━━━━\n💰 `%s`\n📊 %%K: `%.1f` (≤%d)\n📉 RSI: `%.1f` (≤%d)\n━━━━━━━━━━━━━━\n%s"
+           % (name, ticker, pr, float(l["%K"]), STOCH_OVERSOLD, float(l["RSI"]), RSI_OVERSOLD, sig), cid)
 
     elif cmd == "/status":
         if not current_watchlist: tg("📋 종목 없음", cid); return
-        tg(f"⏳ {len(current_watchlist)}개 확인 중...", cid)
+        tg("⏳ %d개 확인 중..." % len(current_watchlist), cid)
         lines = []
         for t in current_watchlist:
             df = fetch(t)
-            if df is None: lines.append(f"• {get_display(t)}: 데이터 없음"); continue
+            if df is None: lines.append("• %s: 데이터 없음" % get_display(t)); continue
             df = calc_rsi(calc_stoch(df, STOCH_K_PERIOD, STOCH_D_PERIOD), RSI_PERIOD)
             l  = df.iloc[-1]
-            lines.append(f"{'🔴' if buy_signal(df) else '⚪'} {get_display(t)} | %K:{l['%K']:.1f} RSI:{l['RSI']:.1f}")
-        tg(f"📊 *전체 현황*\n━━━━━━━━━━━━━━\n" + "\n".join(lines) + "\n━━━━━━━━━━━━━━\n🔴 매수 | ⚪ 대기", cid)
+            lines.append("%s %s | %%K:%.1f RSI:%.1f" % ("🔴" if buy_signal(df) else "⚪", get_display(t), float(l["%K"]), float(l["RSI"])))
+        tg("📊 *전체 현황*\n━━━━━━━━━━━━━━\n%s\n━━━━━━━━━━━━━━\n🔴 매수 | ⚪ 대기" % "\n".join(lines), cid)
 
     elif cmd == "/help":
         tg("📖 *명령어*\n━━━━━━━━━━━━━━\n"
@@ -259,6 +243,7 @@ def handle(text, cid):
     else:
         tg("❓ 알 수 없는 명령어\n/help 확인", cid)
 
+# ── 봇 리스너 ──
 def listener():
     log.info("📨 수신 시작")
     offset = None
@@ -271,8 +256,9 @@ def listener():
                 cid    = str(msg.get("chat", {}).get("id", ""))
                 if txt.startswith("/"): handle(txt, cid)
         except Exception as e:
-            log.error(f"리스너 오류: {e}"); time.sleep(5)
+            log.error("리스너 오류: %s" % str(e)); time.sleep(5)
 
+# ── 알람 루프 ──
 def alert_loop():
     alerted = {}
     while True:
@@ -283,21 +269,20 @@ def alert_loop():
             if df is None: continue
             df = calc_rsi(calc_stoch(df, STOCH_K_PERIOD, STOCH_D_PERIOD), RSI_PERIOD)
             l  = df.iloc[-1]
-            log.info(f"[{get_display(ticker)}] %K={l['%K']:.1f} RSI={l['RSI']:.1f}")
+            log.info("[%s] %%K=%.1f RSI=%.1f" % (get_display(ticker), float(l["%K"]), float(l["RSI"])))
             if buy_signal(df):
-                pr = f"{l['Close']:,.0f}원" if is_korean(ticker) else f"{l['Close']:.2f}"
-                tg(f"🔔 *매수 신호!*\n━━━━━━━━━━━━━━\n📌 *{get_display(ticker)}*\n"
-                   f"💰 `{pr}`\n📊 %K:`{l['%K']:.1f}` 📉 RSI:`{l['RSI']:.1f}`\n"
-                   f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n━━━━━━━━━━━━━━\n⚠️ 투자 판단은 본인 책임")
+                pr  = "%s원" % "{:,.0f}".format(float(l["Close"])) if is_korean(ticker) else "%.2f" % float(l["Close"])
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                tg("🔔 *매수 신호!*\n━━━━━━━━━━━━━━\n📌 *%s*\n💰 `%s`\n📊 %%K:`%.1f` 📉 RSI:`%.1f`\n🕐 %s\n━━━━━━━━━━━━━━\n⚠️ 투자 판단은 본인 책임"
+                   % (get_display(ticker), pr, float(l["%K"]), float(l["RSI"]), now))
                 alerted[ticker] = today
         alerted = {k: v for k, v in alerted.items() if v == today}
-        log.info(f"⏳ {CHECK_INTERVAL_MINUTES}분 대기")
+        log.info("⏳ %d분 대기" % CHECK_INTERVAL_MINUTES)
         time.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 def run():
     threading.Thread(target=build_krx_map, daemon=True).start()
-    tg(f"🚀 *v4 시작!* 종목: {len(current_watchlist)}개\n"
-       "한국주식 원화 정확!\n`/add 삼성전자` `/add AAPL`\n/help")
+    tg("🚀 *v5 시작!* 종목: %d개\n한국주식 이름 검색 가능!\n`/add 삼성전자` `/add AAPL`\n/help" % len(current_watchlist))
     threading.Thread(target=listener, daemon=True).start()
     alert_loop()
 
